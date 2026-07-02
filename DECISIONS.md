@@ -1,17 +1,21 @@
 ## 1. Tenant + role flow: token → data layer
-`POST /api/auth/login` looks up a user by (globally unique) email, checks the
-password, and signs a JWT with exactly three claims: `userId`, `tenantId`,
-`role`. From that point on, **no other request ever accepts a tenant id from
-the client** - not in the URL, not in the body, not in a query param.
-`requireAuth` middleware verifies the token, confirms the tenant still
-exists, and attaches `req.auth = { userId, tenantId, role }`. Every
-controller reads `req.auth.tenantId` and folds it into the Mongo filter as
-the first, mandatory field (`{ tenantId, ...restOfFilter }`). Every
-compound index also puts `tenantId` first, so tenant scoping and query
-performance are the same design decision, not two. Role authorization is a
-second, independent gate (`requireRole('admin')` on the report route);
-tenant scoping and role checking are deliberately separate middlewares so
-neither can be bypassed by getting the other one "close enough."
+`POST /api/auth/login` looks up a user by (globally unique) email, checks
+the password, and signs a JWT with exactly three claims: `userId`,
+`tenantId`, `role`. The login form intentionally does NOT ask "which
+tenant" - tenant is resolved server-side from the matched user document,
+not supplied by the client, so there's no tenant field anywhere for a
+client to get wrong or spoof. From that point on, no other request ever
+accepts a tenant id from the client - not in the URL, not in the body, not
+in a query param. `requireAuth` middleware verifies the token, confirms the
+tenant still exists (see #7), and attaches `req.auth = { userId, tenantId,
+role }`. Every controller reads `req.auth.tenantId` and folds it into the
+Mongo filter as the first, mandatory field. Every compound index also puts
+`tenantId` first, so tenant scoping and query performance are the same
+design decision, not two. Role authorization is a second, independent gate
+(`requireRole('admin')`); tenant scoping and role checking are deliberately
+separate middlewares so neither can be bypassed by getting the other one
+"close enough" - a bug in role logic can never accidentally leak
+cross-tenant data, because the tenant filter doesn't depend on role at all.
 
 ## 2. N+1 fix & indexes
 The catalog list (`GET /api/products`) is a single `Product.find()` +
@@ -36,15 +40,22 @@ full stop. The only things trusted from the client are "which product" and
 ## 4. No-oversell guarantee
 Each cart line is applied as one atomic conditional update:
 `findOneAndUpdate({ _id, tenantId, stock: { $gte: qty } }, { $inc: { stock: -qty } })`.
-Two concurrent "last unit" requests race on that same `$gte` check - only
-one can win. All line updates plus the order insert share one MongoDB
-transaction, so a failure on item 2 of 3 rolls back item 1's decrement too
-(the "reject the whole order, leave DB unchanged" requirement). **Where it
-breaks:** transactions require a replica set (docker-compose provisions a
-1-node `rs0` for this reason); under very high contention on one product,
-competing transactions retry on `TransientTransactionError` (bounded to 3
-retries here) rather than ever overselling - that's a latency cost, not a
-correctness one.
+Concretely: two cashiers both add the last unit (stock=1) and hit checkout
+within milliseconds of each other. MongoDB serializes writes to the same
+document - whichever request's update actually executes first sees
+`stock: 1`, the `$gte` condition passes, stock becomes 0. The second
+request's update now evaluates `$gte` against `stock: 0`, the condition
+fails, `findOneAndUpdate` returns null, and the service throws a 409 with
+`INSUFFICIENT_STOCK` - no partial write, no negative stock, ever. All line
+updates plus the order insert share one MongoDB transaction, so a failure
+on item 2 of a 3-item cart rolls back item 1's decrement too (the "reject
+the whole order, leave DB unchanged" requirement). **Where it breaks:**
+transactions require a replica set (docker-compose provisions a 1-node
+`rs0` for this reason - a standalone mongod would fail immediately with
+"Transaction numbers are only allowed on a replica set"); under very high
+contention on one product, competing transactions retry on
+`TransientTransactionError` (bounded to 3 retries here) rather than ever
+overselling - that's a latency cost, not a correctness one.
 
 ## 5. Margin boundary at the data layer
 `Product.costPrice` and `Order.items.costPriceAtSale` both carry
@@ -56,12 +67,21 @@ on purpose: schema-level `select:false` as the floor, explicit projections
 as the ceiling.
 
 ## 6. Webhook idempotency & ordering
-The handler first tries to `insert` a `WebhookEvent` document keyed by the
+Two independent safeguards, because they cover different failure modes.
+First: the handler tries to `insert` a `WebhookEvent` document keyed by the
 provider's `eventId` (unique index) *inside* the same transaction as the
-order update. A duplicate key means "already fully processed" → 200,
-no-op. Defense in depth: the order update is additionally conditional on
-`status: 'pending_payment'`, so even a *different* eventId for an
-already-paid order is a safe no-op rather than double-counted revenue.
+order update. A duplicate key means "this exact event was already fully
+processed" → 200, no-op. This covers the standard case - a provider retries
+the same webhook because it didn't see our 200 in time. Second, independent
+guard: the order update is additionally conditional on `status:
+'pending_payment'`. This matters because a provider could send two
+*different* eventIds that both claim the same order is paid (e.g. a
+regenerated event id after their own retry logic, or a misconfigured
+provider firing twice) - the eventId check alone wouldn't catch that, since
+the ids differ. The status-conditional update does: only the first webhook
+to find the order still pending actually flips it and updates the cache;
+every later one, regardless of eventId, is a safe no-op rather than
+double-counted revenue in the Stage 7 report.
 
 ## 7. Missing/unknown tenant
 Tenant only ever comes from the JWT, never a request. If the token has no
