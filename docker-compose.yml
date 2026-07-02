@@ -50,14 +50,14 @@ services:
       PAYMENT_WEBHOOK_SECRET: change-me-webhook-secret
       REPORT_CACHE_TTL_MS: 30000
 
-  # frontend:
-  #   build: ./frontend
-  #   depends_on:
-  #     - backend
-  #   ports:
-  #     - "5173:5173"
-  #   environment:
-  #     VITE_API_URL: http://localhost:4000/api
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:4000/api
 
 volumes:
   mongo_data:
